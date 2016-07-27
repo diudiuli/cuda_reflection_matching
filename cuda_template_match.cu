@@ -5,31 +5,55 @@
 #include <stdio.h>
 #include <iostream>
 #include <math.h>
+#include <vector>
+#include <string>
 #include <opencv2/opencv.hpp>
+#include <opencv2/nonfree/features2d.hpp>
 #include </usr/local/cuda-7.5/include/cuda.h>
 
-#define KERNEL_WIDTH 25
-#define KERNEL_RADIUS 12
-#define TILE_WIDTH 6
+#define KERNEL_WIDTH 21
+#define KERNEL_RADIUS (KERNEL_WIDTH/2)
+#define TILE_WIDTH (33-KERNEL_WIDTH)
 #define BLK_SIZE (TILE_WIDTH+KERNEL_WIDTH-1)
-#define IMGSIZE 307200
-//#include 
+#define TMP_NUM 16
+
 using namespace std;
 using namespace cv;
+
 //global image and templates
 Mat img, gray_img;
-Mat templs[256];
-__constant__ float deviceKernel[KERNEL_WIDTH*KERNEL_WIDTH];
 
-__global__ void conv2d(float* A, float* B, const int x_size, const int y_size)
+Mat templs[TMP_NUM];
+Mat img_vec[TMP_NUM];
+Point kpt_vec[TMP_NUM];
+//deviceKernel for storing the templates 
+__constant__ float deviceKernel[TMP_NUM*KERNEL_WIDTH*KERNEL_WIDTH];
+///////////////////////////////////////////////////////////////////
+/* conv2d
+ *      Description: This funtion is CUDA kernel. Where perform the 2D convolution of the images and templates.
+ *                   Using CV_TM_CCOEFF_NORMED method for template matching. Simutaneously perform 2D convolution
+ *                   on several images with specific templates.
+ *      Input: A -- the input data of images
+ *             x_size -- the image width
+ *             y_size -- the image height
+ *             template_num -- the total templates need to be matched.
+ *      Output: B -- the convolution results of the images.
+ *      
+ * 
+*/
+///////////////////////////////////////////////////////////////////
+__global__ void conv2d(float* A, float* B, const int x_size, const int y_size, const int template_num)
 {
-   
+   //allocated shared memory for storing the image
     __shared__ float Nds[BLK_SIZE][BLK_SIZE];
     int tx = threadIdx.x;
     int ty = threadIdx.y;
+
+
     int bx = blockIdx.x;
     int by = blockIdx.y;
-    
+    int bz = blockIdx.z;
+
     int x_out = bx*TILE_WIDTH + tx;
     int y_out = by*TILE_WIDTH + ty;
     
@@ -38,9 +62,10 @@ __global__ void conv2d(float* A, float* B, const int x_size, const int y_size)
     float res = 0.0;
     float templ_res = 0.0;
     float img_res = 0.0;
-    if((x_in>=0) && (x_in<x_size) && (y_in>=0) && (y_in<y_size))
+    //copy the image to the shared memeory 
+    if((x_in>=0) && (x_in<x_size) && (y_in>=0) && (y_in<y_size) && (bz>=0) && (bz<template_num) )
     {
-        Nds[ty][tx] = A[y_in*x_size + x_in];
+        Nds[ty][tx] = A[bz*x_size*y_size + y_in*x_size + x_in];
     }
     else
     {
@@ -48,154 +73,206 @@ __global__ void conv2d(float* A, float* B, const int x_size, const int y_size)
     }
     __syncthreads();
 
-    
-    if( (tx<TILE_WIDTH) && (ty<TILE_WIDTH) && (x_out<x_size) && (y_out<y_size) )
+    //perform convolution below using CV_TM_CCOEFF_NORMED method for template matching
+    if( (tx<TILE_WIDTH) && (ty<TILE_WIDTH) && (x_out<x_size) && (y_out<y_size) && (bz>=0) && (bz<template_num))
     {
-        for( int idx_y=0; idx_y<KERNEL_WIDTH; idx_y++ )
-        {
-            for( int idx_x=0; idx_x<KERNEL_WIDTH; idx_x++ )
+            res = 0.0;
+            templ_res = 0.0;
+            img_res = 0.0;
+            for( int idx_y=0; idx_y<KERNEL_WIDTH; idx_y++ )
             {
-                templ_res += pow(deviceKernel[idx_y*KERNEL_WIDTH+idx_x],2);
-                img_res += pow(Nds[ty+idx_y][tx+idx_x],2);
-                res += Nds[ty+idx_y][tx+idx_x] * deviceKernel[idx_y*KERNEL_WIDTH+idx_x];
-                //printf("%f\n",res);
-  
+                for( int idx_x=0; idx_x<KERNEL_WIDTH; idx_x++ )
+                {
+                    
+                    templ_res += pow(deviceKernel[bz*KERNEL_WIDTH*KERNEL_WIDTH+idx_y*KERNEL_WIDTH+idx_x],2);
+                    img_res += pow(Nds[ty+idx_y][tx+idx_x],2);
+                    res += Nds[ty+idx_y][tx+idx_x] * deviceKernel[bz*KERNEL_WIDTH*KERNEL_WIDTH+idx_y*KERNEL_WIDTH+idx_x];
+                    
+    
+                }
             }
-        }
+            //copy the result into the output data
+            __syncthreads();
+            if((x_out<x_size) && (y_out<y_size) && (bz<template_num))
+            {
+                B[bz*x_size*y_size + y_out*x_size + x_out] = res/sqrt(templ_res*img_res);
+            }
+            __syncthreads();
         
-        __syncthreads();
-        if((x_out<x_size) && (y_out<y_size))
-        {
-            //printf("here\n");
-            B[y_out*x_size + x_out] = res/sqrt(templ_res*img_res);
-        }
     }
    
 }
 ///////////////////////////////////////////////////////////////////
 /* cuda_tp_img
- *      Description: This program use for preparation step for the 
- *                   cuda kernel   
- *      Input: templates number    
+ *      Description: This function use for preparation step for the 
+ *                   cuda kernel. It is allocate several memory space
+ *                   on both GPU and CPU. It also be used to select the
+ *                   peak value of the convolution results  
+ *      Input: templates number -- the total number of templates that need to
+ *                                 be matched.
  *      Output: 0 -- success, -1 -- failure
  *      
  * 
 */
 ///////////////////////////////////////////////////////////////////
+
 int cuda_tp_img(int template_num)
 {
-    int x_size = gray_img.cols;
-    int y_size = gray_img.rows;
+   
+    //get size of templates and images.
+    int x_size = img_vec[0].cols;
+    int y_size = img_vec[0].rows;
     int tmp_x_size = KERNEL_WIDTH;//templs[0].cols;
     int tmp_y_size = KERNEL_WIDTH;//templs[0].rows;
-    cout << x_size << " " << y_size << endl;
-    cout << tmp_x_size << " " << tmp_y_size << endl;
     int img_size = x_size * y_size;
     int tmpl_size = tmp_x_size * tmp_y_size;
     
     //allocate a space to store the image intensity
-    float* host_img = (float*) malloc(sizeof(float)*img_size);
-    float* host_templ = (float*) malloc(sizeof(float)*tmpl_size);
+    float* host_img = (float*) malloc(sizeof(float)*img_size*template_num);
+    float* host_templ = (float*) malloc(sizeof(float)*tmpl_size*template_num);
+    float* gpu_out = (float*) malloc(sizeof(float)*img_size*template_num);
 
     float* device_img_input;
     float* device_img_output;
-    float gpu_out[307200];
-    
-    for(int y=0; y<y_size; y++)
+  
+    //copy the intensity value from image
+    for(int img_idx=0; img_idx<template_num; img_idx++)
     {
-        for(int x=0; x<x_size; x++)
+        for(int y=0; y<y_size; y++)
         {
-            Scalar intensity = gray_img.at<uchar>(y,x);
-            host_img[y*x_size+x] = intensity.val[0]/100;
-            //cout << host_img[y*x_size+x]<<" ";
-        }
-        //cout << endl;
-        
+            for(int x=0; x<x_size; x++)
+            {
+                Scalar intensity = img_vec[img_idx].at<uchar>(y,x);
+                host_img[y*x_size+x + img_idx*img_size] = intensity.val[0];
+            }   
+         } 
+         
     }
-    for(int y=0; y<tmp_y_size; y++)
+    //copy the intensity value from templates
+    for(int tmpl_idx=0; tmpl_idx<template_num; tmpl_idx++)
     {
-        for(int x=0; x<tmp_x_size; x++)
+        for(int y=0; y<tmp_y_size; y++)
         {
-            Scalar intensity = templs[0].at<uchar>(y,x);
-            host_templ[y*tmp_x_size+x] = intensity.val[0]/100;
-            //cout << host_templ[y*tmp_x_size+x]<<" ";
+            for(int x=0; x<tmp_x_size; x++)
+            {
+                Scalar intensity = templs[tmpl_idx].at<uchar>(y,x);
+                host_templ[y*tmp_x_size+x+tmpl_idx*tmpl_size] = intensity.val[0];
+            }        
         }
-        //cout << endl;        
     }
     //allocate memory in cuda global memory
-    cudaMalloc( (void**)&device_img_input, img_size*sizeof(float) );
-    cudaMalloc( (void**)&device_img_output, img_size*sizeof(float) );
+    cudaMalloc( (void**)&device_img_input, img_size*sizeof(float)*template_num  );
+    cudaMalloc( (void**)&device_img_output, img_size*sizeof(float)*template_num );
 
-    cout << cudaMemcpy( device_img_input, host_img, img_size*sizeof(float), cudaMemcpyHostToDevice) << endl;
-    cout << cudaMemcpyToSymbol( deviceKernel, host_templ, tmpl_size*sizeof(float)) << endl;
+    cudaMemcpy( device_img_input, host_img, img_size*sizeof(float)*template_num, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol( deviceKernel, host_templ, tmpl_size*sizeof(float)*template_num);
 
     //assign blocks and threads
     dim3 Dimblock(BLK_SIZE, BLK_SIZE, 1);
-    dim3 DimGrid(((TILE_WIDTH+x_size)-1/TILE_WIDTH), ((TILE_WIDTH+y_size)-1/TILE_WIDTH),1);
+    dim3 DimGrid(((TILE_WIDTH+x_size)-1/TILE_WIDTH), ((TILE_WIDTH+y_size)-1/TILE_WIDTH),template_num);
     //calling the convolution gpu function
-    conv2d <<< DimGrid, Dimblock >>>( device_img_input, device_img_output, x_size, y_size);
+    conv2d <<< DimGrid, Dimblock >>>( device_img_input, device_img_output, x_size, y_size, template_num);
     cudaDeviceSynchronize();
     
-    cout << cudaMemcpy( gpu_out, device_img_output, img_size*sizeof(float), cudaMemcpyDeviceToHost) << endl;
+    cudaMemcpy( gpu_out, device_img_output, img_size*sizeof(float)*template_num, cudaMemcpyDeviceToHost);
+    //Selecting peak value of each image's convolution result and label out on the image.
     float res = 0;
-    int x_pos, y_pos;
-    for(int y=0; y<y_size; y++)
+    int y_pos;
+    for(int idx=0; idx<template_num; idx++)
     {
-        for(int x=0; x<x_size; x++)
+        y_pos = 0;
+        res = 0;
+        for(int y=0; y<y_size; y++)
         {
-           cout << gpu_out[y*x_size+x] << " ";
-           if(gpu_out[y*x_size+x]>res)
-           {
-                res = gpu_out[y*x_size+x];
-                x_pos = x;
-                y_pos = y;
-           }
-        }  
-        cout << endl;      
+            for(int x=0; x<x_size; x++)
+            {
+                
+                if(gpu_out[idx*img_size+y*x_size+x]>res)
+                {
+                    res = gpu_out[idx*img_size+y*x_size+x];
+                    y_pos = y;
+                }
+            }  
+        }
+        rectangle(img, Point(kpt_vec[idx].x-KERNEL_RADIUS,(img.rows/2)+y_pos-KERNEL_RADIUS), Point(kpt_vec[idx].x+KERNEL_RADIUS,(img.rows/2)+y_pos+KERNEL_RADIUS), Scalar(0,255,0 ), 1, 4);
+        line(img,kpt_vec[idx],Point(kpt_vec[idx].x,(img.rows/2)+y_pos),Scalar(0,0,255),1,8,0);
     }
-    //cout << x_pos << " " << y_pos << " " << res << endl;
-    //cout << gpu_out[59*x_size+102] << endl;
-    rectangle(gray_img, Point(x_pos-12,y_pos-12), Point(x_pos+12,y_pos+12), Scalar(0,255,0 ), 2, 4);
+
+    //Free the allocated memory before    
     cudaFree(device_img_input);
     cudaFree(device_img_output);
     free(host_img);
     free(host_templ);
+    free(gpu_out);
     return 0;
 }
 
 
 int main(int argc, char*argv[])
 {
+    
     //first check how many argumnents are input
     int template_num;
     if(argc < 2)
     {
         cout << "wrong input" << endl;
-        cout << "Usage: ./cuda_template_matching [image] 'tempalte1, template2, template3, ..." << endl;
+        cout << "Usage: <some folder path> " << endl;
         return -1;
     }
-    if(argc == 2)
+    vector<string > filenames;
+    string folder = argv[1];
+    glob(folder,filenames);
+    VideoWriter video("reflection_matching.avi", CV_FOURCC('M','J','P','G'), 10, Size(800, 600),true);
+    for(size_t img_index=3000; img_index<3100; img_index++)
     {
-        cout << "there is no templates need to match" << endl;
-        return -1;
-        
-    }
-    template_num = argc - 2;
-    img = imread( argv[1], 1);
-    //convert the image to gray scale in order to only have one pointer
-    cvtColor(img, gray_img, CV_BGR2GRAY);
-    //loading the template into the program
-    for( unsigned int i = 0; i<template_num; i++)
-    {
-        Mat curr_tmpl = imread(argv[2+i],1);
-        cvtColor(curr_tmpl, templs[i], CV_BGR2GRAY);
-        //cout << templs[i].cols << " " << templs[i].rows << endl;
-        //imshow("curr tmpl", templs[i]);
-        //waitKey(0);
 
+        template_num = TMP_NUM;
+        img = imread(filenames[img_index], 1);
+        if(!img.data)
+        {
+            cout << "Problem loading image !!!" << endl;
+            return -1;
+        }
+        //convert the image to gray scale in order to only have one pointer
+        cvtColor(img, gray_img, CV_BGR2GRAY);
+        //cropping the image
+        Mat hf_img = gray_img(Rect(0,0,gray_img.cols,gray_img.rows/2));
+
+        vector<Point2f > corners;
+        Mat mask;
+        bool useHarrisDetector = false;
+        goodFeaturesToTrack(hf_img, corners, TMP_NUM, 0.01, 20.0, mask, 3, useHarrisDetector, 0.04);
+        Point kpt;
+    
+        for(int temp_generate_idx = 0; temp_generate_idx<template_num; temp_generate_idx++)
+        {
+            kpt = corners[temp_generate_idx];
+            //boundary check for the images
+            if( kpt.x < KERNEL_RADIUS)  
+                kpt.x = KERNEL_RADIUS;
+            if( kpt.x > (img.cols-KERNEL_WIDTH) )
+                kpt.x = img.cols-KERNEL_WIDTH;
+            if( kpt.y < KERNEL_RADIUS)
+                kpt.y = KERNEL_RADIUS;
+            if( kpt.y > ((img.rows/2)-KERNEL_WIDTH) )
+                kpt.y = (img.rows/2)-KERNEL_WIDTH;
+            //label the original feature point of the image
+            rectangle(img, Point(kpt.x-KERNEL_RADIUS,kpt.y-KERNEL_RADIUS), Point(kpt.x+KERNEL_RADIUS,kpt.y+KERNEL_RADIUS), Scalar(255,0,0 ), 1, 4);
+            Mat curr_tmpl = hf_img(Rect(kpt.x-KERNEL_RADIUS,kpt.y-KERNEL_RADIUS,KERNEL_WIDTH,KERNEL_WIDTH));
+            //flip the template in order to find the reflections
+            flip(curr_tmpl,templs[temp_generate_idx],0);
+
+            
+            //cropping the image
+            img_vec[temp_generate_idx] = gray_img(Rect(kpt.x-KERNEL_RADIUS,gray_img.rows/2,KERNEL_WIDTH,gray_img.rows/3));
+            kpt_vec[temp_generate_idx] = kpt;
+            
+        }
+     
+        cuda_tp_img(template_num);
+        video.write(img);
+        imshow("img", img);
+        waitKey(1);
     }
-    cuda_tp_img(template_num);
-    imshow("img", gray_img);
-    waitKey(0);
-    return 0;
+        return 0;
 }
